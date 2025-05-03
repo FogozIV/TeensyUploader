@@ -1,0 +1,3 @@
+[submodule "lib/PacketHandling"]
+	path = lib/PacketHandling
+	url = git@github.com:FogozIV/PacketHandling.git
