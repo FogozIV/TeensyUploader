@@ -26,11 +26,11 @@ const uint16_t MAX_SIZE_FILE = 8192;
 void readFile(std::ifstream* file, const std::shared_ptr<std::vector<uint8_t>>& data, uint16_t SIZE = MAX_SIZE_FILE) {
     file->read(reinterpret_cast<char *>(data->data()), SIZE);
 }
-void flash_packet(PacketDispatcher* dispatcher, std::ifstream* file, std::function<void(std::shared_ptr<IPacket>)>* sendPacket, bool& done) {
+void flash_packet(PacketDispatcher* dispatcher, std::ifstream* file, std::function<void(std::shared_ptr<IPacket>)>* sendPacket, std::atomic<bool>& done) {
     dispatcher->registerCallBack<StartFlashPacket>([&](std::shared_ptr<StartFlashPacket> start_flash_packet) {
         std::shared_ptr<bool> kill_packets = std::make_shared<bool>(false);
         dispatcher->registerCallBack<ReceivedDataPacket>([&](std::shared_ptr<ReceivedDataPacket> received_data_packet) {
-            std::cout << ".";
+            std::cout << "." << std::flush;
             auto data = std::make_shared<std::vector<uint8_t>>();
             data->resize(MAX_SIZE_FILE);
             readFile(file, data, MAX_SIZE_FILE);
@@ -61,14 +61,17 @@ void flash_packet(PacketDispatcher* dispatcher, std::ifstream* file, std::functi
     });
     dispatcher->registerCallBack<IssueStartingFlashingPacket>([&](std::shared_ptr<IssueStartingFlashingPacket> issue_starting_flashing_packet) {
         std::cout << "Issue while starting flashing" << std::endl;
+        done = true;
         return true;
     });
     dispatcher->registerCallBack<AlreadyFlashingPacket>([&](std::shared_ptr<AlreadyFlashingPacket> already_flashing_packet) {
         std::cout << "Already flashing" << std::endl;
+        done = true;
         return true;
     });
     dispatcher->registerCallBack<IssueFlashingPacket>([&](std::shared_ptr<IssueFlashingPacket> issue_flashing_packet) {
         std::cout << "Issue while flashing" << std::endl;
+        done = true;
         return true;
     });
     std::cout << "Waiting for start flashing..." << std::endl;
@@ -130,40 +133,31 @@ int main(int argc, char* argv[]){
     }
 #endif
 
-    // Create socket
-#ifdef _WIN32
-    SOCKET sock;
-#else
-    int sock;
-#endif
-#ifdef _WIN32
-    sock = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    struct addrinfo hints{}, *res;
+    hints.ai_family = AF_INET; // IPv4
+    hints.ai_socktype = SOCK_STREAM;
+
+    int err = getaddrinfo(argv[1], argv[2], &hints, &res);
+    if (err != 0) {
+        std::cerr << "getaddrinfo failed: " << gai_strerror(err) << "\n";
+        return 1;
+    }
+
+    SOCKET sock = socket(res->ai_family, res->ai_socktype, res->ai_protocol);
     if (sock == INVALID_SOCKET) {
         std::cerr << "Socket creation failed.\n";
         WSACleanup();
         return 1;
     }
-#else
-    sock = socket(AF_INET, SOCK_STREAM, 0);
-    if (sock < 0) {
-        perror("Socket creation failed");
-        return 1;
-    }
-#endif
-
-    sockaddr_in serverAddr{};
-    serverAddr.sin_family = AF_INET;
-    serverAddr.sin_port = htons(std::stoi(argv[2]));
-    inet_pton(AF_INET, argv[1], &serverAddr.sin_addr);
-
     if (
 #ifdef _WIN32
-connect(sock, (SOCKADDR*)&serverAddr, sizeof(serverAddr)) == SOCKET_ERROR
+connect(sock, res->ai_addr, (int)res->ai_addrlen) == SOCKET_ERROR
 #else
-        connect(sock, (struct sockaddr*)&serverAddr, sizeof(serverAddr)) < 0
+        connect(sock, res->ai_addr, res->ai_addrlen) < 0
 #endif
             ) {
         std::cerr << "Connection failed.\n";
+        freeaddrinfo(res);
 #ifdef _WIN32
         closesocket(sock);
         WSACleanup();
@@ -171,7 +165,14 @@ connect(sock, (SOCKADDR*)&serverAddr, sizeof(serverAddr)) == SOCKET_ERROR
         close(sock);
 #endif
         return 1;
-            }
+    }
+
+#ifdef _WIN32
+    if (sock == INVALID_SOCKET) {
+        std::cerr << "Invalid socket!" << std::endl;
+        return 1;
+    }
+#endif
 
     std::ifstream file(argv[3], std::ios::binary);
     if (!file) {
@@ -196,17 +197,55 @@ connect(sock, (SOCKADDR*)&serverAddr, sizeof(serverAddr)) == SOCKET_ERROR
     std::vector<std::shared_ptr<IPacket>> dispatcher_packets_locked;
     PacketDispatcher dispatcher;
     uint8_t buffer[1024];
-    bool disable_thread = false;
+    std::atomic<bool> disable_thread = false;
     std::mutex loggerMutex;
     std::mutex dispatching_mutex;
     std::mutex dispatching_mutex_locked;
+    loggerMutex.lock();//No threads but for the example
+    std::cout << "Connection established, starting recv thread" << std::endl;
+    loggerMutex.unlock();
     std::thread t([&] {
         while (!disable_thread) {
             int length = recv(sock, reinterpret_cast<char *>(buffer), 1024, 0);
+#ifdef WIN32
             if (length == -1) {
-                disable_thread = true;
-                return;
+                int err = WSAGetLastError();
+                switch (err) {
+                    case WSAENOTCONN:
+                        std::cerr << "recv error: socket not connected\n";
+                        disable_thread = true;
+                        return;
+                    case WSAENOTSOCK:
+                        std::cerr << "recv error: not a socket\n";
+                        disable_thread= true;
+                        return;
+
+                    case WSAEINTR:
+                        std::cerr << "recv error: interrupted\n"; break;
+                        disable_thread = true;
+                        return;
+                    case WSAEWOULDBLOCK: break; // OK in non-blocking
+                    case WSAEINVAL:
+                        std::cerr << "recv error: invalid argument (socket state?)\n";
+                        disable_thread = true;
+                        return;
+                    default: {
+                        std::cerr << "recv failed: WSAGetLastError() = " << err << "\n";
+                        disable_thread = true;
+                        return;
+                        break;
+                    }
+                }
             }
+#else
+            if (length == -1) {
+                if (errno == EWOULDBLOCK || errno == EAGAIN) {
+                    // Non-blocking socket, no data yet
+                } else {
+                    perror("recv");
+                }
+            }
+#endif
             if (length < 0) {
                 continue;
             }
@@ -231,6 +270,7 @@ connect(sock, (SOCKADDR*)&serverAddr, sizeof(serverAddr)) == SOCKET_ERROR
             }
         }
     });
+
     t.detach();
 
     std::thread dispatcher_thread([&] {
@@ -253,20 +293,27 @@ connect(sock, (SOCKADDR*)&serverAddr, sizeof(serverAddr)) == SOCKET_ERROR
     dispatcher_thread.detach();
 
     dispatcher.registerCallBack<PingPacket>([&](std::shared_ptr<PingPacket> ping)->bool {
+        loggerMutex.lock();
         std::cout << "Ping received\n";
+        loggerMutex.unlock();
         sendPacket(std::make_shared<PongPacket>(ping->getUniqueID()));
         return false;
     });
-    std::this_thread::sleep_for(std::chrono::milliseconds(10));
-
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    loggerMutex.lock();
     std::cout << "Flashing" << std::endl;
+    loggerMutex.unlock();
     flash_packet(&dispatcher, &file, &sendPacket, disable_thread);
 
     while (!disable_thread) {
 
     }
     file.close();
+    t.join();
+    dispatcher_thread.join();
+    freeaddrinfo(res);
 #ifdef _WIN32
+
     closesocket(sock);
     WSACleanup();
 #else
