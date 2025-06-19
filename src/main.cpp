@@ -26,10 +26,10 @@ const uint16_t MAX_SIZE_FILE = 8192;
 void readFile(std::ifstream* file, const std::shared_ptr<std::vector<uint8_t>>& data, uint16_t SIZE = MAX_SIZE_FILE) {
     file->read(reinterpret_cast<char *>(data->data()), SIZE);
 }
-void flash_packet(PacketDispatcher* dispatcher, std::ifstream* file, std::function<void(std::shared_ptr<IPacket>)>* sendPacket, std::atomic<bool>& done) {
-    dispatcher->registerCallBack<StartFlashPacket>([&](std::shared_ptr<StartFlashPacket> start_flash_packet) {
+void flash_packet(PacketDispatcher* dispatcher, std::ifstream* file, std::function<void(std::shared_ptr<IPacket>)>* sendPacket, std::atomic<bool>* done) {
+    dispatcher->registerCallBack<StartFlashPacket>([dispatcher, file, sendPacket, done](std::shared_ptr<StartFlashPacket> start_flash_packet) {
         std::shared_ptr<bool> kill_packets = std::make_shared<bool>(false);
-        dispatcher->registerCallBack<ReceivedDataPacket>([&](std::shared_ptr<ReceivedDataPacket> received_data_packet) {
+        dispatcher->registerCallBack<ReceivedDataPacket>([file, sendPacket, kill_packets](std::shared_ptr<ReceivedDataPacket> received_data_packet) {
             std::cout << "." << std::flush;
             auto data = std::make_shared<std::vector<uint8_t>>();
             data->resize(MAX_SIZE_FILE);
@@ -50,25 +50,28 @@ void flash_packet(PacketDispatcher* dispatcher, std::ifstream* file, std::functi
 
             (*sendPacket)(std::make_shared<DataPacket>(*data));
         }
-        dispatcher->registerCallBack<FlashingSoftwarePacket>([&](std::shared_ptr<FlashingSoftwarePacket> flashing_software_packet) {
+        dispatcher->registerCallBack<FlashingSoftwarePacket>([kill_packets, done](std::shared_ptr<FlashingSoftwarePacket> flashing_software_packet) {
             std::cout << "Flashing new code" << std::endl;
             *kill_packets = true;
-            done = true;
+            *done = true;
             return true;
         });
         
         return true;
     });
-    dispatcher->registerCallBack<IssueStartingFlashingPacket>([&](std::shared_ptr<IssueStartingFlashingPacket> issue_starting_flashing_packet) {
+    dispatcher->registerCallBack<IssueStartingFlashingPacket>([done](std::shared_ptr<IssueStartingFlashingPacket> issue_starting_flashing_packet) {
         std::cout << "Issue while starting flashing" << std::endl;
+        *done = true;
         return true;
     });
-    dispatcher->registerCallBack<AlreadyFlashingPacket>([&](std::shared_ptr<AlreadyFlashingPacket> already_flashing_packet) {
+    dispatcher->registerCallBack<AlreadyFlashingPacket>([done](std::shared_ptr<AlreadyFlashingPacket> already_flashing_packet) {
         std::cout << "Already flashing" << std::endl;
+        *done = true;
         return true;
     });
-    dispatcher->registerCallBack<IssueFlashingPacket>([&](std::shared_ptr<IssueFlashingPacket> issue_flashing_packet) {
+    dispatcher->registerCallBack<IssueFlashingPacket>([done](std::shared_ptr<IssueFlashingPacket> issue_flashing_packet) {
         std::cout << "Issue while flashing" << std::endl;
+        *done = true;
         return true;
     });
     std::cout << "Waiting for start flashing..." << std::endl;
@@ -164,13 +167,6 @@ connect(sock, res->ai_addr, (int)res->ai_addrlen) == SOCKET_ERROR
         return 1;
     }
 
-#ifdef _WIN32
-    if (sock == INVALID_SOCKET) {
-        std::cerr << "Invalid socket!" << std::endl;
-        return 1;
-    }
-#endif
-
     std::ifstream file(argv[3], std::ios::binary);
     if (!file) {
         std::cerr << "Could not open firmware file.\n";
@@ -187,7 +183,7 @@ connect(sock, res->ai_addr, (int)res->ai_addrlen) == SOCKET_ERROR
     std::function<void(std::shared_ptr<IPacket>)> sendPacket = [&](std::shared_ptr<IPacket> packet) {
         sending_packet.lock();
         auto pp_ = handler.createPacket(packet);
-        int len = send(sock,reinterpret_cast<const char *>(pp_.data()), pp_.size(), 0);
+        send(sock,reinterpret_cast<const char *>(pp_.data()), pp_.size(), 0);
         sending_packet.unlock();
     };
     std::vector<std::shared_ptr<IPacket>> dispatcher_packets;
@@ -294,18 +290,19 @@ connect(sock, res->ai_addr, (int)res->ai_addrlen) == SOCKET_ERROR
     loggerMutex.lock();
     std::cout << "Flashing" << std::endl;
     loggerMutex.unlock();
-    flash_packet(&dispatcher, &file, &sendPacket, disable_thread);
+    flash_packet(&dispatcher, &file, &sendPacket, &disable_thread);
 
     while (!disable_thread) {
         std::this_thread::sleep_for(std::chrono::milliseconds(100));
     }
+    std::cout << "Ending" << std::endl;
+    closesocket(sock);
     file.close();
     t.join();
     dispatcher_thread.join();
     freeaddrinfo(res);
 #ifdef _WIN32
 
-    closesocket(sock);
     WSACleanup();
 #else
     close(sock);
