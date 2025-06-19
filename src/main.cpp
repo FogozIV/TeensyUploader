@@ -61,17 +61,14 @@ void flash_packet(PacketDispatcher* dispatcher, std::ifstream* file, std::functi
     });
     dispatcher->registerCallBack<IssueStartingFlashingPacket>([&](std::shared_ptr<IssueStartingFlashingPacket> issue_starting_flashing_packet) {
         std::cout << "Issue while starting flashing" << std::endl;
-        done = true;
         return true;
     });
     dispatcher->registerCallBack<AlreadyFlashingPacket>([&](std::shared_ptr<AlreadyFlashingPacket> already_flashing_packet) {
         std::cout << "Already flashing" << std::endl;
-        done = true;
         return true;
     });
     dispatcher->registerCallBack<IssueFlashingPacket>([&](std::shared_ptr<IssueFlashingPacket> issue_flashing_packet) {
         std::cout << "Issue while flashing" << std::endl;
-        done = true;
         return true;
     });
     std::cout << "Waiting for start flashing..." << std::endl;
@@ -246,9 +243,6 @@ connect(sock, res->ai_addr, (int)res->ai_addrlen) == SOCKET_ERROR
                 }
             }
 #endif
-            if (length < 0) {
-                continue;
-            }
             handler.receiveData(buffer, length);
             auto checkStatus = CheckStatus::BAD_CRC;
             std::shared_ptr<IPacket> packet;
@@ -271,8 +265,6 @@ connect(sock, res->ai_addr, (int)res->ai_addrlen) == SOCKET_ERROR
         }
     });
 
-    t.detach();
-
     std::thread dispatcher_thread([&] {
         while (!disable_thread) {
             std::this_thread::sleep_for(std::chrono::milliseconds(10));
@@ -290,7 +282,6 @@ connect(sock, res->ai_addr, (int)res->ai_addrlen) == SOCKET_ERROR
             dispatching_mutex_locked.unlock();
         }
     });
-    dispatcher_thread.detach();
 
     dispatcher.registerCallBack<PingPacket>([&](std::shared_ptr<PingPacket> ping)->bool {
         loggerMutex.lock();
@@ -306,7 +297,7 @@ connect(sock, res->ai_addr, (int)res->ai_addrlen) == SOCKET_ERROR
     flash_packet(&dispatcher, &file, &sendPacket, disable_thread);
 
     while (!disable_thread) {
-
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
     }
     file.close();
     t.join();
